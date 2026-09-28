@@ -6,6 +6,7 @@ from basicsr.utils.download_util import load_file_from_url
 from facexlib.utils.face_restoration_helper import FaceRestoreHelper
 from torchvision.transforms.functional import normalize
 
+from gfpgan.fastpath import paste_context
 from gfpgan.archs.gfpgan_bilinear_arch import GFPGANBilinear
 from gfpgan.archs.gfpganv1_arch import GFPGANv1
 from gfpgan.archs.gfpganv1_clean_arch import GFPGANv1Clean
@@ -142,7 +143,8 @@ class GFPGANer():
 
             self.face_helper.get_inverse_affine(None)
             # paste each restored face to the input image
-            restored_img = self.face_helper.paste_faces_to_input_image(upsample_img=bg_img)
+            with paste_context(self.face_helper):
+                restored_img = self.face_helper.paste_faces_to_input_image(upsample_img=bg_img)
             return self.face_helper.cropped_faces, self.face_helper.restored_faces, restored_img
         else:
             return self.face_helper.cropped_faces, self.face_helper.restored_faces, None

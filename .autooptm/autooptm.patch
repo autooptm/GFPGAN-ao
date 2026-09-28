@@ -1,0 +1,262 @@
+diff --git a/gfpgan/fastpath.py b/gfpgan/fastpath.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3cbb2436eaca8e35612741128802b8f9b3b2dc0d
+--- /dev/null
++++ b/gfpgan/fastpath.py
+@@ -0,0 +1,161 @@
++import os
++import queue
++import threading
++
++import numpy as np
++import torch
++
++
++def mode():
++    v = (os.environ.get("GFPGAN_FAST") or "1").strip().lower()
++    if v in ("0", "off", "false", "no"):
++        return "off"
++    if v in ("lossless", "exact"):
++        return "lossless"
++    return "full"
++
++
++def enabled(sw):
++    m = mode()
++    if m == "off":
++        return False
++    if m == "lossless":
++        return sw in ("sw1", "sw2", "sw3")
++    return True
++
++
++def _pre_hook_1(_module, args):
++    if args and torch.is_tensor(args[0]):
++        return (args[0].contiguous(memory_format=torch.channels_last),) + tuple(args[1:])
++    return None
++
++
++def tune_bg_upsampler(bg):
++    import types
++    import cv2
++
++    if not enabled('sw1'):
++        return bg
++
++    if enabled('sw7'):
++        bg.model.to(memory_format=torch.channels_last)
++        head = getattr(bg.model, 'conv_first', None) or bg.model
++        head.register_forward_pre_hook(_pre_hook_1)
++
++    if enabled('sw4'):
++        try:
++            from basicsr.archs.rrdbnet_arch import RRDB
++            if not getattr(RRDB, '_ao_opt_done', False):
++                RRDB.forward = torch.compile(RRDB.forward)
++                RRDB._ao_opt_done = True
++        except Exception:                                         # noqa: BLE001
++            pass
++
++    stock_enhance = type(bg).enhance
++
++    def enhance(self, img, outscale=None, alpha_upsampler='realesrgan'):
++        if img.ndim != 3 or img.shape[2] != 3 or img.dtype != np.uint8:
++            return stock_enhance(self, img, outscale=outscale, alpha_upsampler=alpha_upsampler)
++        h_input, w_input = img.shape[0:2]
++        self.pre_process(cv2.cvtColor(img.astype(np.float32) / 255., cv2.COLOR_BGR2RGB))
++        if self.tile_size > 0:
++            self.tile_process()
++        else:
++            self.process()
++        out = self.post_process().detach().squeeze(0).float().clamp_(0, 1)
++        out = (out[[2, 1, 0], :, :] * 255.0).round_().to(torch.uint8)
++        output = out.permute(1, 2, 0).contiguous().cpu().numpy()
++        if outscale is not None and outscale != float(self.scale):
++            output = cv2.resize(output, (int(w_input * outscale), int(h_input * outscale)),
++                                interpolation=cv2.INTER_LANCZOS4)
++        return output, 'RGB'
++
++    bg.enhance = types.MethodType(enhance, bg)
++    return bg
++
++
++class paste_context:
++
++    def __init__(self, helper):
++        self.helper = helper
++        self.on = enabled('sw2') or enabled('sw5')
++
++    def __enter__(self):
++        if not self.on:
++            return self
++        import cv2
++        self._cv2 = cv2
++        self._resize, self._warp, self._blur = cv2.resize, cv2.warpAffine, cv2.GaussianBlur
++        exact = enabled('sw2')
++        f32 = enabled('sw5')
++        resize, warp, blur = self._resize, self._warp, self._blur
++
++        def _f32(src):
++            if f32 and getattr(src, 'dtype', None) == np.float64:
++                return src.astype(np.float32)
++            return src
++
++        def resize_(src, dsize, *a, **kw):
++            if (exact and dsize is not None and not kw.get('fx') and not kw.get('fy')
++                    and getattr(src, 'ndim', 0) >= 2
++                    and src.shape[1] == dsize[0] and src.shape[0] == dsize[1]):
++                return src.copy()
++            return resize(_f32(src), dsize, *a, **kw)
++
++        def warp_(src, M, dsize, *a, **kw):
++            return warp(_f32(src), M, dsize, *a, **kw)
++
++        def blur_(src, ksize, sigmaX, *a, **kw):
++            return blur(_f32(src), ksize, sigmaX, *a, **kw)
++
++        cv2.resize, cv2.warpAffine, cv2.GaussianBlur = resize_, warp_, blur_
++        return self
++
++    def __exit__(self, *exc):
++        if self.on:
++            self._cv2.resize = self._resize
++            self._cv2.warpAffine = self._warp
++            self._cv2.GaussianBlur = self._blur
++        return False
++
++
++class OutputWriter:
++
++    def __init__(self, enable=True):
++        self.on = enable and enabled('sw3')
++        if not self.on:
++            return
++        self.q = queue.Queue(maxsize=1)
++        self.err = None
++        self.t = threading.Thread(target=self._loop, name='gfpgan-writer', daemon=True)
++        self.t.start()
++
++    def _loop(self):
++        from basicsr.utils import imwrite
++        while True:
++            item = self.q.get()
++            if item is None:
++                self.q.task_done()
++                return
++            img, path = item
++            try:
++                imwrite(img, path)
++            except Exception as exc:                              # noqa: BLE001
++                self.err = exc
++            finally:
++                self.q.task_done()
++
++    def write(self, img, path):
++        from basicsr.utils import imwrite
++        if not self.on:
++            return imwrite(img, path)
++        if self.err is not None:
++            raise self.err
++        self.q.put((img, path))
++
++    def close(self):
++        if not self.on:
++            return
++        self.q.join()
++        if self.err is not None:
++            raise self.err
+diff --git a/gfpgan/utils.py b/gfpgan/utils.py
+index 74ee5a83ce5319c83dfd7de8ade27093c3f77a02..6f8bad28ff9a866fe06bc6ba4a8493c88bef2ce7 100644
+--- a/gfpgan/utils.py
++++ b/gfpgan/utils.py
+@@ -6,6 +6,7 @@ from basicsr.utils.download_util import load_file_from_url
+ from facexlib.utils.face_restoration_helper import FaceRestoreHelper
+ from torchvision.transforms.functional import normalize
+ 
++from gfpgan.fastpath import paste_context
+ from gfpgan.archs.gfpgan_bilinear_arch import GFPGANBilinear
+ from gfpgan.archs.gfpganv1_arch import GFPGANv1
+ from gfpgan.archs.gfpganv1_clean_arch import GFPGANv1Clean
+@@ -142,7 +143,8 @@ class GFPGANer():
+ 
+             self.face_helper.get_inverse_affine(None)
+             # paste each restored face to the input image
+-            restored_img = self.face_helper.paste_faces_to_input_image(upsample_img=bg_img)
++            with paste_context(self.face_helper):
++                restored_img = self.face_helper.paste_faces_to_input_image(upsample_img=bg_img)
+             return self.face_helper.cropped_faces, self.face_helper.restored_faces, restored_img
+         else:
+             return self.face_helper.cropped_faces, self.face_helper.restored_faces, None
+diff --git a/inference_gfpgan.py b/inference_gfpgan.py
+index 845bbad54e7bd2cf67253565210b0a4afd811e4b..24b4b43fbd0ac4de0a11f8192732ae1f9887e7d0 100644
+--- a/inference_gfpgan.py
++++ b/inference_gfpgan.py
+@@ -7,6 +7,7 @@ import torch
+ from basicsr.utils import imwrite
+ 
+ from gfpgan import GFPGANer
++from gfpgan import fastpath
+ 
+ 
+ def main():
+@@ -67,14 +68,18 @@ def main():
+             from basicsr.archs.rrdbnet_arch import RRDBNet
+             from realesrgan import RealESRGANer
+             model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=2)
++            bg_tile = args.bg_tile
++            if fastpath.enabled('sw6') and bg_tile == parser.get_default('bg_tile'):
++                bg_tile = 0
+             bg_upsampler = RealESRGANer(
+                 scale=2,
+                 model_path='https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth',
+                 model=model,
+-                tile=args.bg_tile,
++                tile=bg_tile,
+                 tile_pad=10,
+                 pre_pad=0,
+                 half=True)  # need to set False in CPU mode
++            bg_upsampler = fastpath.tune_bg_upsampler(bg_upsampler)
+     else:
+         bg_upsampler = None
+ 
+@@ -123,6 +128,8 @@ def main():
+         bg_upsampler=bg_upsampler)
+ 
+     # ------------------------ restore ------------------------
++    writer = fastpath.OutputWriter()
++
+     for img_path in img_list:
+         # read image
+         img_name = os.path.basename(img_path)
+@@ -142,17 +149,17 @@ def main():
+         for idx, (cropped_face, restored_face) in enumerate(zip(cropped_faces, restored_faces)):
+             # save cropped face
+             save_crop_path = os.path.join(args.output, 'cropped_faces', f'{basename}_{idx:02d}.png')
+-            imwrite(cropped_face, save_crop_path)
++            writer.write(cropped_face, save_crop_path)
+             # save restored face
+             if args.suffix is not None:
+                 save_face_name = f'{basename}_{idx:02d}_{args.suffix}.png'
+             else:
+                 save_face_name = f'{basename}_{idx:02d}.png'
+             save_restore_path = os.path.join(args.output, 'restored_faces', save_face_name)
+-            imwrite(restored_face, save_restore_path)
++            writer.write(restored_face, save_restore_path)
+             # save comparison image
+             cmp_img = np.concatenate((cropped_face, restored_face), axis=1)
+-            imwrite(cmp_img, os.path.join(args.output, 'cmp', f'{basename}_{idx:02d}.png'))
++            writer.write(cmp_img, os.path.join(args.output, 'cmp', f'{basename}_{idx:02d}.png'))
+ 
+         # save restored img
+         if restored_img is not None:
+@@ -165,7 +172,9 @@ def main():
+                 save_restore_path = os.path.join(args.output, 'restored_imgs', f'{basename}_{args.suffix}.{extension}')
+             else:
+                 save_restore_path = os.path.join(args.output, 'restored_imgs', f'{basename}.{extension}')
+-            imwrite(restored_img, save_restore_path)
++            writer.write(restored_img, save_restore_path)
++
++    writer.close()
+ 
+     print(f'Results are in the [{args.output}] folder.')
+ 

@@ -1,3 +1,65 @@
+<div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>GFPGAN · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>1.39x faster end to end</b> on the command below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-1.39x-2ea44f"></a>
+    <a href="https://github.com/TencentARC/GFPGAN/commit/7552a7791caad982045a7bbe5634bbf1cd5c8679"><img alt="base" src="https://img.shields.io/badge/upstream-7552a7791caa-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-RTX%204090-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [TencentARC/GFPGAN](https://github.com/TencentARC/GFPGAN) at commit
+> [`7552a7791caa`](https://github.com/TencentARC/GFPGAN/commit/7552a7791caad982045a7bbe5634bbf1cd5c8679) with the AutoOptm patch applied on top.
+> The optimisation was found, measured and verified automatically by [AutoOptm](https://autooptm.com);
+> the patch is also kept verbatim at [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+## The result
+
+| | |
+|---|---|
+| **Command** | `python inference_gfpgan.py -i inputs/whole_imgs -o results -v 1.3 -s 2` |
+| **Entry point** | `inference_gfpgan.py` |
+| **Unit measured** | one photo: read → face detection → GFPGAN v1.3 face restoration → 2× background upsampling → paste-back → the program's outputs written to disk. The repository's three example photos (`inputs/whole_imgs`) repeated to 40 photos in one process, the first 4 as warm-up |
+| **Before (stock)** | 1,377 ms per photo (55.1 s for the 40-photo loop) |
+| **After (this tree, all switches default ON)** | 993 ms per photo (39.7 s for the 40-photo loop; process startup, 7.1 s for stock and 8.0 s for this tree, is not included) |
+| **Speedup** | **1.39x** end to end on RTX 4090, noise floor of the host 1.3% |
+| **Output** | every restored image at PSNR 48.4 dB against the stock program's (worst 1% of pixels trimmed, those within 6/255 levels; 0.06% of pixels differ by more than 20/255); 47.4 dB on held-out photos the optimiser never saw |
+
+### What changed
+
+| File | Where | Gain (alone) |
+|---|---|---|
+| `gfpgan/utils.py` | GFPGANer.enhance() | 1.21x |
+| `inference_gfpgan.py` | main() | 1.139x |
+| `gfpgan/fastpath.py` | tune_bg_upsampler() | 1.052x |
+| `gfpgan/fastpath.py` | tune_bg_upsampler() | 1.026x |
+| `inference_gfpgan.py` | main() | 1.012x |
+| `gfpgan/fastpath.py` | tune_bg_upsampler() | 1.004x |
+| `gfpgan/utils.py` | GFPGANer.enhance() | 0.974x |
+| `gfpgan/fastpath.py` | new module | 1.0x |
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/GFPGAN-ao.git
+cd GFPGAN-ao
+# set up exactly as upstream documents (the v1.3 weights download on first run), then:
+python inference_gfpgan.py -i inputs/whole_imgs -o results -v 1.3 -s 2
+```
+
+The diff against upstream is one commit: `git log -1 -p` shows it, and
+`git diff 7552a7791caa` is the same patch as `.autooptm/autooptm.patch`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
 <p align="center">
   <img src="assets/gfpgan_logo.png" height=130>
 </p>
